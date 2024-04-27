@@ -1,20 +1,26 @@
 mod command;
+mod command_input;
 mod runtime_data;
 mod simple_text_block;
+mod source_code;
 
 use crate::interactive::runtime_data::RuntimeDataWidget;
 use crate::interactive::simple_text_block::SimpleTextBlock;
-use crate::{Instruction, LoadedInstruction, RuntimeContext, RuntimeOptions, Script};
-use crossterm::event;
+use crate::{Instruction, LoadedInstruction, RuntimeContext, RuntimeContextU64, Script};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{event, execute};
 use ratatui::layout::Constraint::{Length, Min};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use spin::RwLock;
+use spin::{Mutex, RwLock};
+use std::borrow::Cow;
+use std::fmt::Display;
 use std::io;
+use std::io::{Cursor, Read};
 use std::ops::Div;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use tui_input::backend::crossterm::EventHandler;
 
 macro_rules! block_widget {
     ($ty:ident => $block:ident) => {
@@ -38,251 +44,287 @@ macro_rules! block_widget {
         }
     };
 }
-pub(self) use block_widget;
+macro_rules! widget_setter {
+    (impl $( < $($impl_bounds:tt $(: $impl_extra_bound:tt $(+ $impl_extra_bounds:tt)* )?),* > )? $type_name:ident $( < $($type_bounds:tt),* > )? { $( $f_name:ident : $f_type:ty $( = $f_value: expr )? ),* }) => {
+        impl$(< $($impl_bounds $(: $impl_extra_bound $(+ $impl_extra_bounds)* )?),* >)? $type_name $(< $($type_bounds)* > )? {
+            $(
+            pub fn $f_name(mut self, $f_name: $f_type) -> Self {
+                self.$f_name = widget_setter!(OR { $f_name } { $($f_value)? });
+                self
+            }
+            )*
+        }
+    };
+    (OR { $default:expr } { } ) => {
+        $default
+    };
+    (OR { $_default:expr } { $value:expr } ) => {
+        $value
+    };
+}
+use crate::interactive::command::{parse_command, Command, CommandPartState, CommandResult};
+use crate::interactive::command_input::{CommandInput, CommandInputState, OwnedCommandResult};
+use crate::interactive::source_code::SourceCode;
+pub(self) use {block_widget, widget_setter};
 
-#[derive(Copy, Clone)]
-enum Activity {
+type Cell = u64;
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum Activity {
     Normal,
     Command,
 }
 
 pub struct InteractiveState {
+    pub should_quit: bool,
     pub execution_paused: bool,
     pub execution_clock_speed: Duration,
     pub last_cycle_time: Instant,
     pub last_executed_instruction: Option<LoadedInstruction>,
     pub frame_count: u128,
     pub script: Script,
-    pub runtime_context: RuntimeContext,
+    pub runtime_context: RuntimeContext<Cell>,
 
     pub activity: Activity,
+    pub command_input: CommandInputState<Cell>,
+    pub command_output: Vec<CommandOutput>,
+}
+pub struct CommandOutput {
+    style: Style,
+    message: Cow<'static, str>,
+}
+impl InteractiveState {
+    fn cmd_info(&mut self, message: impl Display) {
+        self.command_output.push(CommandOutput {
+            style: styles::COMMAND_OUTPUT_INFO,
+            message: Cow::Owned(message.to_string()),
+        })
+    }
+    fn cmd_error(&mut self, message: impl Display) {
+        self.command_output.push(CommandOutput {
+            style: styles::COMMAND_OUTPUT_ERROR,
+            message: format!("Error: {}", message).into(),
+        })
+    }
+}
+impl InteractiveState {
+    fn execute(&mut self) {
+        if !self.script.has_remaining_instructions() {
+            return;
+        }
+        self.last_executed_instruction = self
+            .script
+            .instructions
+            .get(self.script.instruction_pointer)
+            .cloned();
+        self.script.execute_instruction(&mut self.runtime_context);
+        self.last_cycle_time = Instant::now();
+    }
+}
+#[derive(Default)]
+struct InteractiveIo {
+    input: Mutex<Cursor<Vec<u8>>>,
+    output: RwLock<Vec<u8>>,
 }
 
 pub fn interactive_runtime<B: Backend>(
     terminal: &mut Terminal<B>,
     mut rt: Script,
 ) -> io::Result<()> {
+    let mut io = Rc::new(InteractiveIo::default());
+
     let mut state = InteractiveState {
+        should_quit: false,
         execution_paused: true,
         execution_clock_speed: Duration::from_millis(100),
         last_cycle_time: Instant::now(),
         last_executed_instruction: None,
         frame_count: 0,
         script: rt,
-        runtime_context: RuntimeContext::new(),
+        runtime_context: RuntimeContext::new(
+            {
+                let io = io.clone();
+                move || {
+                    let mut buf = [0u8];
+                    io.input
+                        .lock()
+                        .read_exact(&mut buf)
+                        .expect("failed to read");
+                    buf[0] as u64
+                }
+            },
+            {
+                let io = io.clone();
+                move |value| {
+                    io.output.write().push(value as u8);
+                }
+            },
+        ),
         activity: Activity::Normal,
+        command_input: CommandInputState::default(),
+        command_output: Vec::new(),
     };
 
-    let mut output = Rc::new(RwLock::new(Vec::new()));
-    state.script.options.write = Box::new({
-        let output = output.clone();
-        move |value| output.write().push(value)
-    });
+    // Since we use RuntimeContext<i128> for extended customisation,
+    // we have to set these default values manually.
+    // For executing code in a standard Brainfuck environment, just using RuntimeContext<u8> is fine.
+    state.runtime_context.min_cell_value = 0;
+    state.runtime_context.max_cell_value = u8::MAX as Cell;
 
     loop {
-        let completed = terminal.draw(|frame| {
-            let vertical = Layout::vertical([Min(3), Length(3), Length(5), Length(3)]);
-
-            let [major_area, misc_area, output_area, command_line] = vertical.areas(frame.size());
-
-            let major_layout = Layout::vertical([Min(0), Length(5), Min(0)]);
-            let [instruction_area, output_area, data_area] = major_layout.areas(major_area);
-
-            let instruction_block = Block::default()
-                .title(" Source code ")
-                .padding(Padding::horizontal(1))
-                .borders(Borders::ALL);
-            let instruction_text_area = instruction_block.inner(instruction_area);
-            frame.render_widget(instruction_block, instruction_area);
-
-            let mut lines = vec![];
-            let mut spans = vec![];
-            let mut span_start = 0;
-            let mut span_is_instruction = false;
-            let mut line_offset = 0;
-            let amount_of_lines = state.script.source.lines().count();
-            let viewable_area_size = { instruction_area.height as f64 * 0.8 }.ceil() as usize;
-            let viewable_areas = amount_of_lines.div_ceil(viewable_area_size);
-            for (i, ch) in state.script.source.char_indices() {
-                let current_span_style = if span_is_instruction {
-                    styles::IRRELEVANT_INSTRUCTION
-                } else {
-                    styles::COMMENT
-                };
-                if let Some(last_executed) = state.last_executed_instruction.as_ref() {
-                    if last_executed.source_position == i {
-                        spans.push(Span::styled(
-                            &state.script.source[span_start..i],
-                            current_span_style,
-                        ));
-                        spans.push(Span::styled(ch.to_string(), styles::EXECUTED_INSTRUCTION));
-                        span_start = i + 1;
-                        if lines.len() >= viewable_area_size {
-                            let area = lines.len().div(viewable_area_size);
-                            line_offset += viewable_area_size * area;
-                        }
-                        continue;
-                    }
-                }
-                if let Some(instruction) = state
-                    .script
-                    .instructions
-                    .get(state.script.instruction_pointer)
-                {
-                    if instruction.source_position == i {
-                        spans.push(Span::styled(
-                            &state.script.source[span_start..i],
-                            current_span_style,
-                        ));
-                        spans.push(Span::styled(ch.to_string(), styles::NEXT_INSTRUCTION));
-                        span_start = i + 1;
-                        continue;
-                    }
-                }
-                if ch == '\n' {
-                    spans.push(Span::styled(
-                        &state.script.source[span_start..i],
-                        current_span_style,
-                    ));
-                    span_start = i + 1;
-                    let line = Line::default().spans(spans.drain(..));
-                    lines.push(line);
-                    continue;
-                }
-                let should_be_instruction = Instruction::from_char(ch) != None;
-                if span_is_instruction != should_be_instruction {
-                    spans.push(Span::styled(
-                        &state.script.source[span_start..i],
-                        current_span_style,
-                    ));
-                    span_start = i;
-                    span_is_instruction = should_be_instruction;
-                }
-            }
-            spans.push(Span::styled(
-                &state.script.source[span_start..state.script.source.len()],
-                if span_is_instruction {
-                    styles::IRRELEVANT_INSTRUCTION
-                } else {
-                    styles::COMMENT
-                },
-            ));
-            lines.push(Line::default().spans(spans.drain(..)));
-
-            frame.render_widget(
-                Paragraph::new(lines).scroll((line_offset as u16, 0)),
-                instruction_text_area,
-            );
-
-            let output_data = output.read();
-            let output_block = SimpleTextBlock::new(String::from_utf8_lossy(&output_data))
-                .title(" Output ")
-                .padding(Padding::horizontal(1))
-                .borders(Borders::ALL);
-            frame.render_widget(output_block, output_area);
-
-            let data = RuntimeDataWidget::new()
-                .title(" Data ")
-                .padding(Padding::horizontal(1))
-                .borders(Borders::ALL);
-            frame.render_stateful_widget(data, data_area, &mut state);
-
-            let misc_layout =
-                Layout::horizontal([Min(10), Length(16), Length(16), Length(16), Length(32)]);
-            let [input_area, state_area, frame_counter_area, cycle_counter_area, speed_area] =
-                misc_layout.areas(misc_area);
-
-            let state_text = {
-                if !state.script.has_remaining_instructions() {
-                    Span::styled("Finished", Style::new().fg(Color::LightRed).bold())
-                } else if state.execution_paused {
-                    Span::styled("Paused", Style::new().fg(Color::LightCyan))
-                } else {
-                    Span::styled("Running", Style::new().fg(Color::LightGreen))
-                }
-            };
-
-            let state_block = SimpleTextBlock::new(state_text)
-                .title("State")
-                .borders(Borders::ALL);
-            frame.render_widget(state_block, state_area);
-
-            let frame_counter =
-                SimpleTextBlock::new(Span::styled(state.frame_count.to_string(), styles::VALUE))
-                    .title("Frame")
-                    .borders(Borders::ALL);
-            frame.render_widget(frame_counter, frame_counter_area);
-
-            let mut line = Line::default();
-            line.push_span(Span::styled(state.script.cycles.to_string(), styles::VALUE));
-
-            let cycle_counter = SimpleTextBlock::new(line)
-                .title("Cycle")
-                .borders(Borders::ALL);
-            frame.render_widget(cycle_counter, cycle_counter_area);
-
-            let speed = humantime::format_duration(state.execution_clock_speed).to_string();
-            let mut line = Line::default();
-            line.push_span(Span::styled(speed, styles::VALUE));
-            line.push_span(Span::styled(" per instruction", styles::VALUE_EXTRA));
-            let speed_block = SimpleTextBlock::new(line)
-                .title("Speed")
-                .borders(Borders::ALL);
-            frame.render_widget(speed_block, speed_area);
-
-            state.frame_count += 1;
-        });
-        let mut execute = |state: &mut InteractiveState| {
-            if !state.script.has_remaining_instructions() {
-                return;
-            }
-            state.last_executed_instruction = state
-                .script
-                .instructions
-                .get(state.script.instruction_pointer)
-                .cloned();
-            state.script.execute_instruction(&mut state.runtime_context);
-            state.last_cycle_time = Instant::now();
-        };
+        let completed = terminal.draw(|frame| ui(frame, &mut state, &io));
         if event::poll(Duration::from_millis(20))? {
             let event = event::read()?;
-            if let Event::Key(key) = event {
-                let keydown = key.kind != KeyEventKind::Release;
-                match key.code {
-                    KeyCode::Char(ch) => match ch {
-                        'q' => return Ok(()),
-                        'n' if keydown => execute(&mut state),
-                        ' ' if keydown => {
-                            state.execution_paused = !state.execution_paused;
-                        }
-                        ':' if keydown => {
-                            state.activity = Activity::Command;
-                        }
-                        _ => {}
-                    },
-                    KeyCode::Up if keydown => {
-                        if let Some(speed) = state
-                            .execution_clock_speed
-                            .checked_add(speed_diff(key.modifiers))
-                        {
-                            state.execution_clock_speed = speed;
-                        }
-                    }
-                    KeyCode::Down if keydown => {
-                        if let Some(speed) = state
-                            .execution_clock_speed
-                            .checked_sub(speed_diff(key.modifiers))
-                        {
-                            state.execution_clock_speed = speed;
-                        }
-                    }
-                    _ => {}
-                }
+
+            match state.activity {
+                Activity::Normal => handle_event_normal(event, &mut state),
+                Activity::Command => handle_event_command(event, &mut state),
             }
         }
         if !state.execution_paused && state.last_cycle_time.elapsed() > state.execution_clock_speed
         {
-            execute(&mut state);
+            state.execute();
+        }
+        if state.should_quit {
+            return Ok(());
+        }
+    }
+}
+
+fn handle_event_normal(event: Event, state: &mut InteractiveState) {
+    if let Event::Key(key) = event {
+        let keydown = key.kind != KeyEventKind::Release;
+        {
+            match key.code {
+                KeyCode::Char(ch) => match ch {
+                    'q' => {
+                        state.should_quit = true;
+                    }
+                    'n' if keydown => state.execute(),
+                    ' ' if keydown => {
+                        state.execution_paused = !state.execution_paused;
+                    }
+                    ':' if keydown => {
+                        state.activity = Activity::Command;
+                    }
+                    _ => {}
+                },
+                KeyCode::Up if keydown => {
+                    if let Some(speed) = state
+                        .execution_clock_speed
+                        .checked_add(speed_diff(key.modifiers))
+                    {
+                        state.execution_clock_speed = speed;
+                    }
+                }
+                KeyCode::Down if keydown => {
+                    if let Some(speed) = state
+                        .execution_clock_speed
+                        .checked_sub(speed_diff(key.modifiers))
+                    {
+                        state.execution_clock_speed = speed;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+fn execute_command(command: &Command<Cell>, state: &mut InteractiveState) {
+    match command {
+        Command::Start => {
+            state.execution_paused = false;
+        }
+        Command::Pause => {
+            state.execution_paused = true;
+        }
+        Command::SetInstructionPointer { idx } => {
+            state.script.instruction_pointer = *idx;
+        }
+        Command::SetDataPointer { idx } => {
+            state.runtime_context.data_pointer = *idx;
+        }
+        Command::SetData { idx, value } => {
+            let idx = idx.unwrap_or(state.runtime_context.data_pointer);
+            *state.runtime_context.get_cell(idx) = *value;
+            state.runtime_context.fix_cell(idx);
+        }
+        Command::SetSpeed { speed } => {
+            state.execution_clock_speed = *speed;
+            state.cmd_info(format_args!(
+                "Set speed to {}",
+                humantime::format_duration(*speed)
+            ))
+        }
+        Command::SetBounds { lower, upper } => {
+            state.runtime_context.min_cell_value = lower.clone();
+            state.runtime_context.max_cell_value = upper.clone();
+        }
+        Command::LoadScriptFromFile { path } => {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(e) => {
+                    state.cmd_error(e);
+                    return;
+                }
+            };
+            state.script = Script::new(content);
+            state.cmd_info(format_args!("Loaded file {}", path.display()));
+        }
+        Command::Quit => {
+            state.should_quit = true;
+        }
+    }
+}
+fn handle_event_command(event: Event, state: &mut InteractiveState) {
+    if let Event::Key(key) = event {
+        match key.code {
+            KeyCode::Enter => {
+                let command_string = state.command_input.input.value().to_string();
+                state.command_input.input.reset();
+                state.command_input.history.push(command_string.clone());
+                state.command_input.current = OwnedCommandResult::empty();
+                // We parse it without allowing autocompletes here
+                // It may be wasteful architecturally (autocompletes and errors could be separate)
+                // but I can't be bothered to implement that change.
+                match parse_command(&command_string, false) {
+                    CommandResult::Parsed { command, .. } => {
+                        execute_command(&command, state);
+                    }
+                    CommandResult::CannotContinue { parts } => {
+                        let mut errors = Vec::new();
+                        parts.iter().for_each(|part| match &part.state {
+                            CommandPartState::Invalid(Some(reason)) => {
+                                errors.push(reason);
+                            }
+                            _ => {}
+                        });
+
+                        state.cmd_error(format_args!(
+                            "could not parse command ({})",
+                            itertools::join(errors.iter().map(|c| -> &str { c.as_ref() }), ", ")
+                        ));
+                    }
+                    CommandResult::TooShort { .. } => {
+                        state.cmd_error("command is not complete (and maybe has errors)");
+                    }
+                }
+                state.activity = Activity::Normal;
+            }
+            KeyCode::Esc => {
+                state.activity = Activity::Normal;
+            }
+            _ => {
+                if let Some(change) = state.command_input.input.handle_event(&event) {
+                    if change.value {
+                        state.command_input.current = OwnedCommandResult::parse(
+                            state.command_input.input.value().to_string(),
+                            true,
+                        );
+                    }
+                }
+                return;
+            }
         }
     }
 }
@@ -303,6 +345,122 @@ fn speed_diff(key_modifiers: KeyModifiers) -> Duration {
     })
 }
 
+fn ui(frame: &mut Frame, state: &mut InteractiveState, io: &Rc<InteractiveIo>) {
+    let vertical = Layout::vertical([Min(3), Length(3), Length(6)]);
+
+    let [major_area, misc_area, command_area] = vertical.areas(frame.size());
+
+    let major_layout = Layout::vertical([Min(0), Length(5), Min(0)]);
+    let [instruction_area, output_area, data_area] = major_layout.areas(major_area);
+
+    let instruction_block = Block::default()
+        .title(" Source code ")
+        .padding(Padding::horizontal(1))
+        .borders(Borders::ALL);
+    let instruction_text_area = instruction_block.inner(instruction_area);
+    frame.render_widget(instruction_block, instruction_area);
+
+    frame.render_widget(
+        SourceCode::new(&state.script.source)
+            .current_instruction_pos(state.last_executed_instruction.map(|v| v.source_position))
+            .current_instruction_style(styles::CURRENT_INSTRUCTION)
+            .next_instruction_pos(state.script.loaded_instruction().map(|v| v.source_position))
+            .next_instruction_style(styles::NEXT_INSTRUCTION)
+            .instruction_style(styles::INSTRUCTION)
+            .comment_style(styles::COMMENT),
+        instruction_text_area,
+    );
+
+    let output_data = io.output.read();
+    let output_block = SimpleTextBlock::new(String::from_utf8_lossy(&output_data))
+        .title(" Output ")
+        .padding(Padding::horizontal(1))
+        .borders(Borders::ALL);
+    frame.render_widget(output_block, output_area);
+
+    let data = RuntimeDataWidget::new()
+        .title(" Data ")
+        .padding(Padding::horizontal(1))
+        .borders(Borders::ALL);
+    frame.render_stateful_widget(data, data_area, state);
+
+    let misc_layout = Layout::horizontal([Min(10), Length(16), Length(16), Length(16), Length(32)]);
+    let [input_area, state_area, frame_counter_area, cycle_counter_area, speed_area] =
+        misc_layout.areas(misc_area);
+
+    let state_text = {
+        if !state.script.has_remaining_instructions() {
+            Span::styled("Finished", Style::new().fg(Color::LightRed).bold())
+        } else if state.execution_paused {
+            Span::styled("Paused", Style::new().fg(Color::LightCyan))
+        } else {
+            Span::styled("Running", Style::new().fg(Color::LightGreen))
+        }
+    };
+
+    let state_block = SimpleTextBlock::new(state_text)
+        .title("State")
+        .borders(Borders::ALL);
+    frame.render_widget(state_block, state_area);
+
+    let frame_counter =
+        SimpleTextBlock::new(Span::styled(state.frame_count.to_string(), styles::VALUE))
+            .title("Frame")
+            .borders(Borders::ALL);
+    frame.render_widget(frame_counter, frame_counter_area);
+
+    let mut line = Line::default();
+    line.push_span(Span::styled(state.script.cycles.to_string(), styles::VALUE));
+
+    let cycle_counter = SimpleTextBlock::new(line)
+        .title("Cycle")
+        .borders(Borders::ALL);
+    frame.render_widget(cycle_counter, cycle_counter_area);
+
+    let speed = humantime::format_duration(state.execution_clock_speed).to_string();
+    let mut line = Line::default();
+    line.push_span(Span::styled(speed, styles::VALUE));
+    line.push_span(Span::styled(" per instruction", styles::VALUE_EXTRA));
+    let speed_block = SimpleTextBlock::new(line)
+        .title("Speed")
+        .borders(Borders::ALL);
+    frame.render_widget(speed_block, speed_area);
+
+    let command_layout = Layout::horizontal([Min(0), Min(0)]);
+    let [command_line_area, command_output_area] = command_layout.areas(command_area);
+
+    let mut command_line_block = Block::new().title(" Command line ").borders(Borders::ALL);
+    let command_input_area = command_line_block.inner(command_line_area);
+    if state.activity == Activity::Command {
+        command_line_block = command_line_block
+            .border_style(styles::ACTIVE_BLOCK)
+            .title_style(styles::ACTIVE_BLOCK);
+    }
+    frame.render_widget(command_line_block, command_line_area);
+
+    let command_input: CommandInput<Cell> = CommandInput::new()
+        .base_style(styles::COMMAND_BASE)
+        .ignored_style(styles::COMMAND_IGNORED)
+        .error_style(styles::COMMAND_ERROR)
+        .error_comment_style(styles::COMMAND_ERROR_COMMENT)
+        .suggestion_style(styles::COMMAND_SUGGESTION);
+    frame.render_stateful_widget(command_input, command_input_area, &mut state.command_input);
+
+    let command_output_block = Block::new().title(" Command output ").borders(Borders::ALL);
+    let command_output_text_area = command_output_block.inner(command_output_area);
+    frame.render_widget(command_output_block, command_output_area);
+
+    let mut command_output = Text::default();
+    for message in state.command_output.iter().rev() {
+        command_output.push_line(
+            Line::default().spans([Span::styled(message.message.clone(), message.style)]),
+        )
+    }
+    frame.render_widget(Paragraph::new(command_output), command_output_text_area);
+
+    state.frame_count += 1;
+}
+
 mod styles {
     use ratatui::style::{Color, Modifier, Style};
 
@@ -310,11 +468,26 @@ mod styles {
     pub const VALUE_EXTRA: Style = Style::new();
     pub const VALUE_MODIFIER: Style = Style::new().add_modifier(Modifier::ITALIC);
     pub const NEXT_INSTRUCTION: Style = Style::new().fg(Color::LightCyan);
-    pub const EXECUTED_INSTRUCTION: Style = Style::new()
+    pub const CURRENT_INSTRUCTION: Style = Style::new()
         .fg(Color::LightBlue)
         .add_modifier(Modifier::BOLD);
-    pub const IRRELEVANT_INSTRUCTION: Style = Style::new();
+    pub const INSTRUCTION: Style = Style::new();
     pub const COMMENT: Style = Style::new()
         .add_modifier(Modifier::DIM)
         .add_modifier(Modifier::ITALIC);
+
+    pub const COMMAND_OUTPUT_INFO: Style = Style::new().fg(Color::LightBlue);
+    pub const COMMAND_OUTPUT_ERROR: Style = Style::new().fg(Color::LightRed);
+
+    pub const COMMAND_BASE: Style = Style::new();
+    pub const COMMAND_IGNORED: Style = Style::new().add_modifier(Modifier::DIM);
+    pub const COMMAND_ERROR: Style = Style::new()
+        .fg(Color::LightRed)
+        .add_modifier(Modifier::BOLD);
+    pub const COMMAND_ERROR_COMMENT: Style = Style::new().fg(Color::LightRed);
+    pub const COMMAND_SUGGESTION: Style = Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+
+    pub const ACTIVE_BLOCK: Style = Style::new().fg(Color::Yellow);
 }

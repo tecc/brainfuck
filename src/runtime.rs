@@ -1,5 +1,6 @@
-use std::io::{stdin, stdout, Read, Write};
-use std::time::Duration;
+pub use crate::runtime::context::*;
+
+mod context;
 
 #[derive(Copy, Clone)]
 pub struct LoadedInstruction {
@@ -7,73 +8,11 @@ pub struct LoadedInstruction {
     pub source_position: usize,
 }
 
-pub struct RuntimeContext {
-    pub data: Vec<u8>,
-    pub data_pointer: usize,
-}
-
-impl RuntimeContext {
-    pub fn new() -> Self {
-        Self {
-            data: Vec::with_capacity(30000), // Minimum capacity according to Wikipedia
-            data_pointer: 0,
-        }
-    }
-    pub fn get_cell(&mut self) -> &mut u8 {
-        if self.data.len() <= self.data_pointer {
-            self.data.resize(self.data_pointer + 1, 0);
-        }
-        &mut self.data[self.data_pointer]
-    }
-    pub fn read_cell(&self) -> u8 {
-        if self.data.len() <= self.data_pointer {
-            return 0;
-        }
-        self.data[self.data_pointer]
-    }
-    pub fn process_cell(&mut self, f: impl FnOnce(u8) -> u8) {
-        let cell = self.get_cell();
-        *cell = f(*cell);
-        *cell;
-    }
-}
-
 pub struct Script {
     pub source: String,
     pub instructions: Vec<LoadedInstruction>,
     pub instruction_pointer: usize,
-
-    pub options: RuntimeOptions,
     pub cycles: usize,
-}
-
-pub struct RuntimeOptions {
-    pub refresh: Option<Box<dyn Fn(&Script, &RuntimeContext)>>,
-    pub write: Box<dyn FnMut(u8)>,
-    pub read: Box<dyn FnMut() -> u8>,
-}
-impl Default for RuntimeOptions {
-    fn default() -> Self {
-        Self {
-            refresh: None,
-            write: Box::new(|value| {
-                stdout().write(&[value]).expect("Could not write");
-            }),
-            read: Box::new(|| {
-                let mut value = [0u8];
-                stdin().read_exact(&mut value).expect("Could not read");
-                value[0]
-            }),
-        }
-    }
-}
-impl RuntimeOptions {
-    pub fn write(&mut self, value: u8) {
-        (self.write)(value)
-    }
-    pub fn read(&mut self) -> u8 {
-        (self.read)()
-    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -87,6 +26,7 @@ pub enum Instruction {
     JumpForwardsIfZero,
     JumpBackwardsIfNonzero,
 }
+
 impl Instruction {
     pub fn from_char(ch: char) -> Option<Self> {
         Some(match ch {
@@ -104,7 +44,7 @@ impl Instruction {
 }
 
 impl Script {
-    pub fn new(source: String, options: RuntimeOptions) -> Self {
+    pub fn new(source: String) -> Self {
         let mut instructions = Vec::new();
         for (u, ch) in source.chars().enumerate() {
             let Some(instruction) = Instruction::from_char(ch) else {
@@ -119,25 +59,15 @@ impl Script {
             source,
             instructions,
             instruction_pointer: 0,
-            options,
             cycles: 0,
         }
     }
 
-    pub fn refresh(&self, context: &RuntimeContext) {
-        if let Some(refresh_fn) = self.options.refresh.as_ref() {
-            refresh_fn(&self, context);
-        }
-    }
-    pub fn clock(&mut self, context: &RuntimeContext) {
-        self.refresh(context);
-    }
-
-    pub fn jump_forwards(&mut self, context: &RuntimeContext) -> bool {
+    pub fn jump_forwards<T: CellType>(&mut self, context: &RuntimeContext<T>) -> bool {
         let mut depth = 0usize;
         while self.instruction_pointer < self.instructions.len() {
             self.instruction_pointer += 1;
-            self.clock(context);
+            context.refresh(self);
             let Some(instruction) = self.instruction() else {
                 break;
             };
@@ -154,11 +84,11 @@ impl Script {
         return false;
     }
 
-    pub fn jump_backwards(&mut self, context: &RuntimeContext) -> bool {
+    pub fn jump_backwards<T: CellType>(&mut self, context: &RuntimeContext<T>) -> bool {
         let mut depth = 0usize;
-        while self.instruction_pointer >= 0 {
+        while self.instruction_pointer > 0 {
             self.instruction_pointer -= 1;
-            self.clock(context);
+            context.refresh(self);
             let Some(instruction) = self.instruction() else {
                 break;
             };
@@ -176,7 +106,7 @@ impl Script {
         return false;
     }
 
-    pub fn execute_instruction(&mut self, context: &mut RuntimeContext) {
+    pub fn execute_instruction<T: CellType>(&mut self, context: &mut RuntimeContext<T>) {
         let Some(instruction) = self.instruction() else {
             return;
         };
@@ -184,22 +114,22 @@ impl Script {
         match instruction {
             Instruction::IncrementDataPointer => context.data_pointer += 1,
             Instruction::DecrementDataPointer => context.data_pointer -= 1,
-            Instruction::IncrementData => context.process_cell(|v| v.overflowing_add(1).0),
-            Instruction::DecrementData => context.process_cell(|v| v.overflowing_sub(1).0),
+            Instruction::IncrementData => context.increment_cell(context.data_pointer),
+            Instruction::DecrementData => context.decrement_cell(context.data_pointer),
             Instruction::OutputData => {
-                self.options.write(context.read_cell());
+                context.write(context.read_cell(context.data_pointer));
             }
             Instruction::AcceptData => {
-                *context.get_cell() = self.options.read();
+                *context.get_cell(context.data_pointer) = context.read();
             }
             Instruction::JumpForwardsIfZero => {
-                if context.read_cell() == 0 {
+                if context.read_cell(context.data_pointer) == T::zero() {
                     self.jump_forwards(context);
                     next_instr = false;
                 }
             }
             Instruction::JumpBackwardsIfNonzero => {
-                if context.read_cell() != 0 {
+                if context.read_cell(context.data_pointer) != T::zero() {
                     self.jump_backwards(context);
                     next_instr = false;
                 }
@@ -208,13 +138,16 @@ impl Script {
         if next_instr {
             self.instruction_pointer += 1;
         }
-        self.clock(context);
+        context.refresh(self);
         self.cycles += 1;
     }
     pub fn instruction(&self) -> Option<Instruction> {
         self.instructions
             .get(self.instruction_pointer)
             .map(|v| v.instruction)
+    }
+    pub fn loaded_instruction(&self) -> Option<LoadedInstruction> {
+        self.instructions.get(self.instruction_pointer).cloned()
     }
 
     pub fn has_remaining_instructions(&self) -> bool {

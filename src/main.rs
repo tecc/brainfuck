@@ -1,5 +1,6 @@
 mod interactive;
 pub mod runtime;
+
 pub use runtime::*;
 
 use crate::interactive::interactive_runtime;
@@ -39,7 +40,9 @@ fn main() {
     let cli = Cli::parse();
 
     let mut code;
-    if cli.stdin {
+    if cli.mode == Mode::Interactive {
+        code = String::new();
+    } else if cli.stdin {
         code = String::new();
         stdin()
             .read_to_string(&mut code)
@@ -53,35 +56,31 @@ fn main() {
             .expect("Could not read line from stdin");
     }
 
-    let runtime_options = match cli.mode {
-        Mode::Default | Mode::Dump | Mode::Interactive => RuntimeOptions::default(),
-        Mode::Debug => RuntimeOptions {
-            refresh: Some(Box::new(|r, ctx| {
-                let instruction = if let Some(instr) = r.instruction() {
-                    format!("{:?}", instr)
-                } else {
-                    format!("<end+{}>", r.instructions.len() - r.instruction_pointer)
-                };
-                println!(
-                    "{}: data(*{}={}) instr(*{}={})",
-                    r.cycles,
-                    ctx.data_pointer,
-                    ctx.read_cell(),
-                    r.instruction_pointer,
-                    instruction
-                )
-            })),
-            ..RuntimeOptions::default()
-        },
-    };
-
     if cli.mode == Mode::Interactive {
-        interactive(Script::new(code, runtime_options)).expect("Failure");
+        interactive(Script::new(code)).expect("Failure");
         return;
     }
 
-    let mut runtime = Script::new(code, runtime_options);
-    let mut context = RuntimeContext::new();
+    let mut runtime = Script::new(code);
+    let mut context = RuntimeContextU8::new_stdio();
+    context.refresh_fn = Some(Box::new(|script, context| {
+        let instruction = if let Some(instr) = script.instruction() {
+            format!("{:?}", instr)
+        } else {
+            format!(
+                "<end+{}>",
+                script.instructions.len() - script.instruction_pointer
+            )
+        };
+        println!(
+            "{}: data(*{}={}) instr(*{}={})",
+            script.cycles,
+            context.data_pointer,
+            context.read_cell(context.data_pointer),
+            script.instruction_pointer,
+            instruction
+        )
+    }));
     while runtime.has_remaining_instructions() {
         runtime.execute_instruction(&mut context);
         if runtime.cycles % 20 == 9 {
