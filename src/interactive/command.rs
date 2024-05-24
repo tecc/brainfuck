@@ -6,6 +6,7 @@ use ratatui::widgets::block::Title;
 use ratatui::widgets::{Block, Borders};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
+use std::fs::DirEntry;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -353,7 +354,7 @@ pub fn parse_command<T: CellType>(cmd_str: &str, autocomplete: bool) -> CommandR
                         todo!("Parsing of bounds");
                         /*return CommandResult::Parsed {
                             parts,
-                            command: Command::SetBounds { .. },
+                            command: Command::SetBounds { ..cargo run },
                         };*/
                     }
                 }
@@ -376,7 +377,10 @@ pub fn parse_command<T: CellType>(cmd_str: &str, autocomplete: bool) -> CommandR
             .map(|v| v.join(file_part.content()))
             .unwrap_or_else(|_| PathBuf::from(file_part.content()));
 
-        fn try_autocomplete(path: &Path) -> io::Result<Option<Cow<'static, str>>> {
+        fn try_autocomplete(
+            path: &Path,
+            query_direct: bool,
+        ) -> io::Result<Option<Cow<'static, str>>> {
             let Some(file_name) = path.file_name() else {
                 return if let Some(parent) = path.parent() {
                     let mut read_dir = parent.read_dir()?;
@@ -391,14 +395,36 @@ pub fn parse_command<T: CellType>(cmd_str: &str, autocomplete: bool) -> CommandR
                 };
             };
             let file_name = file_name.to_string_lossy();
-            if let Some(parent) = path.parent() {
+
+            let (target, start_with) = if query_direct {
+                (Some(path), "")
+            } else {
+                (path.parent(), file_name.as_ref())
+            };
+            if let Some(parent) = target {
                 let dir = parent.read_dir()?;
+
+                let mut found_suggestion: Option<(DirEntry, String)> = None;
                 for entry in dir {
                     let entry = entry?;
                     let entry_name = entry.file_name().to_string_lossy().into_owned();
-                    if entry_name.starts_with(file_name.as_ref()) {
-                        return Ok(Some(entry_name.into()));
+                    if entry_name.starts_with(start_with) {
+                        if let Some((previous_entry, previous_name)) = &mut found_suggestion {
+                            if entry_name.as_str() < previous_name.as_str() {
+                                *previous_entry = entry;
+                                *previous_name = entry_name;
+                            }
+                        } else {
+                            found_suggestion = Some((entry, entry_name))
+                        }
                     }
+                }
+                if let Some((suggestion, mut suggestion_str)) = found_suggestion {
+                    if file_name == suggestion_str && suggestion.path().is_dir() {
+                        suggestion_str.push(std::path::MAIN_SEPARATOR);
+                    }
+
+                    return Ok(Some(suggestion_str.into()));
                 }
             }
 
@@ -412,11 +438,21 @@ pub fn parse_command<T: CellType>(cmd_str: &str, autocomplete: bool) -> CommandR
                 CommandPartState::Invalid(Some("path does not refer to a file".into()))
         }
         if autocomplete {
-            if let Ok(Some(suggestion)) = try_autocomplete(&file_path) {
+            // TODO: Fix the try_autocomplete function so that the parent path is
+            //       the input instead of it guessing the parent.
+            //       The result of not doing that is this unrefined salad.
+            let at_end = file_part.content().ends_with(std::path::is_separator);
+
+            if let Ok(Some(suggestion)) = try_autocomplete(&file_path, at_end) {
                 let base = PathBuf::from(file_part.content());
                 let full_suggestion = base.parent();
                 file_part.state = CommandPartState::Autocomplete {
-                    suggestion: if let Some(parent) = full_suggestion {
+                    suggestion: if at_end {
+                        base.join(suggestion.as_ref())
+                            .to_string_lossy()
+                            .into_owned()
+                            .into()
+                    } else if let Some(parent) = full_suggestion {
                         parent
                             .join(suggestion.as_ref())
                             .to_string_lossy()

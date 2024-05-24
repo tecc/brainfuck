@@ -9,7 +9,7 @@ use crate::interactive::simple_text_block::SimpleTextBlock;
 use crate::{Instruction, LoadedInstruction, RuntimeContext, RuntimeContextU64, Script};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{event, execute};
-use ratatui::layout::Constraint::{Length, Min};
+use ratatui::layout::Constraint::{Length, Max, Min};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use spin::{Mutex, RwLock};
@@ -346,11 +346,11 @@ fn speed_diff(key_modifiers: KeyModifiers) -> Duration {
 }
 
 fn ui(frame: &mut Frame, state: &mut InteractiveState, io: &Rc<InteractiveIo>) {
-    let vertical = Layout::vertical([Min(3), Length(3), Length(6)]);
+    let vertical = Layout::vertical([Min(10), Length(3), Max(6)]);
 
     let [major_area, misc_area, command_area] = vertical.areas(frame.size());
 
-    let major_layout = Layout::vertical([Min(0), Length(5), Min(0)]);
+    let major_layout = Layout::vertical([Min(3), Length(3), Min(0)]);
     let [instruction_area, output_area, data_area] = major_layout.areas(major_area);
 
     let instruction_block = Block::default()
