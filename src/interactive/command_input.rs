@@ -6,9 +6,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::mem;
 use std::pin::Pin;
+use tui_input::Input;
 
 pub struct CommandInput<T: CellType> {
     _data: PhantomData<T>,
@@ -18,6 +20,7 @@ pub struct CommandInput<T: CellType> {
     error_comment_style: Style,
     suggestion_style: Style,
     cursor_style: Style,
+    scroll: (u16, u16),
 }
 impl<T> CommandInput<T>
 where
@@ -32,6 +35,7 @@ where
             error_comment_style: Style::new(),
             suggestion_style: Style::new(),
             cursor_style: Style::new(),
+            scroll: (0, 0),
         }
     }
 }
@@ -41,12 +45,14 @@ widget_setter! { impl<T: CellType> CommandInput<T> {
     error_style: Style,
     error_comment_style: Style,
     suggestion_style: Style,
-    cursor_style: Style
+    cursor_style: Style,
+    scroll: (u16, u16)
 } }
 pub struct CommandInputState<T: CellType> {
     pub input: tui_input::Input,
-    pub history: Vec<String>,
     pub current: OwnedCommandResult<T>,
+    pub history: VecDeque<String>,
+    pub history_selected: Option<usize>,
 }
 impl<T> Default for CommandInputState<T>
 where
@@ -55,14 +61,33 @@ where
     fn default() -> Self {
         Self {
             input: Default::default(),
-            history: Vec::new(),
+            history: VecDeque::new(),
+            history_selected: None,
             current: OwnedCommandResult::empty(),
+        }
+    }
+}
+impl<T> CommandInputState<T>
+where
+    T: CellType,
+{
+    pub fn set_input_value(&mut self, value: String) {
+        self.input = Input::new(value.clone());
+        self.current = OwnedCommandResult::parse(value, true);
+    }
+    pub fn set_input_value_to_history(&mut self) {
+        if let Some(idx) = self.history_selected {
+            let target = self.history.get(idx).unwrap();
+            self.set_input_value(target.clone());
+        } else {
+            self.set_input_value(String::new())
         }
     }
 }
 
 pub struct OwnedCommandResult<T: CellType> {
     source: *mut Cow<'static, str>, // I really like Cows. Moo.
+    // TODO: Make this only accessible through references.
     pub result: CommandResult<'static, T>,
 }
 
@@ -228,6 +253,6 @@ where
             .into_iter()
             .for_each(|line| text.push_line(line));
 
-        Paragraph::new(text).render(area, buf);
+        Paragraph::new(text).scroll(self.scroll).render(area, buf);
     }
 }

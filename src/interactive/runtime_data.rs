@@ -1,4 +1,4 @@
-use crate::interactive::block_widget;
+use crate::interactive::{block_widget, Cell};
 use ratatui::prelude::*;
 use ratatui::widgets::block::Title;
 use ratatui::widgets::{Block, Borders, Table};
@@ -20,5 +20,7 @@ impl<'a> StatefulWidget for RuntimeDataWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let content_area = self.block.inner(area);
         self.block.render(area, buf);
+
+        "[This feature doesn't yet exist :(]".render(content_area, buf)
     }
 }

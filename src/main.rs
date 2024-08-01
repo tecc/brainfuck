@@ -108,15 +108,18 @@ fn interactive(runtime: Script) -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen);
+    execute!(stdout, EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    terminal.hide_cursor()?;
+
     let res = interactive_runtime(&mut terminal, runtime);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
+    res?;
     Ok(())
 }

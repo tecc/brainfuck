@@ -83,6 +83,30 @@ impl<'a> CommandPart<'a> {
         }
     }
 
+    pub fn split_at(&self, split_point: usize) -> (Self, Option<Self>) {
+        let new_end = self.start + split_point;
+        let mut first = Self {
+            source: self.source,
+            start: self.start,
+            end: self.end,
+            state: CommandPartState::Ok,
+        };
+        if new_end >= self.end {
+            return (first, None)
+        }
+        first.end = new_end;
+        let second = Self {
+            source: self.source,
+            start: new_end,
+            end: self.end,
+            state: CommandPartState::Ignored,
+        };
+        if second.len() > 0 {
+            return (first, Some(second));
+        }
+        return (first, None)
+    }
+    
     pub fn split_whitespace(&self) -> (Self, Option<Self>) {
         let mut first = Self {
             source: self.source,

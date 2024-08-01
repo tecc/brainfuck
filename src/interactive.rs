@@ -278,11 +278,16 @@ fn execute_command(command: &Command<Cell>, state: &mut InteractiveState) {
 }
 fn handle_event_command(event: Event, state: &mut InteractiveState) {
     if let Event::Key(key) = event {
+        let is_down = key.kind != KeyEventKind::Release;
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter if is_down => {
                 let command_string = state.command_input.input.value().to_string();
                 state.command_input.input.reset();
-                state.command_input.history.push(command_string.clone());
+                state
+                    .command_input
+                    .history
+                    .push_front(command_string.clone());
+                state.command_input.history_selected = None;
                 state.command_input.current = OwnedCommandResult::empty();
                 // We parse it without allowing autocompletes here
                 // It may be wasteful architecturally (autocompletes and errors could be separate)
@@ -311,9 +316,74 @@ fn handle_event_command(event: Event, state: &mut InteractiveState) {
                 }
                 state.activity = Activity::Normal;
             }
-            KeyCode::Esc => {
+            KeyCode::Esc if is_down => {
                 state.activity = Activity::Normal;
             }
+            KeyCode::Up if is_down => {
+                let history_len = state.command_input.history.len();
+                if history_len == 0 {
+                    return;
+                }
+
+                if let Some(value) = &mut state.command_input.history_selected {
+                    *value += 1;
+                    if *value >= history_len {
+                        *value = history_len - 1;
+                    }
+                } else {
+                    state.command_input.history_selected = Some(0);
+                }
+
+                if let Some(idx) = state.command_input.history_selected {
+                    let target = state.command_input.history.get(idx).unwrap();
+                    state.command_input.set_input_value(target.clone());
+                }
+
+                state.command_input.set_input_value_to_history()
+            }
+            KeyCode::Down if is_down => {
+                let history_len = state.command_input.history.len();
+                if history_len == 0 {
+                    return;
+                }
+
+                if let Some(value) = &mut state.command_input.history_selected {
+                    if *value == 0 {
+                        state.command_input.history_selected = None;
+                    } else {
+                        *value -= 1;
+                    }
+                }
+
+                state.command_input.set_input_value_to_history()
+            }
+            KeyCode::Tab if is_down => match &state.command_input.current.result {
+                CommandResult::TooShort { parts, .. } | CommandResult::Parsed { parts, .. } => {
+                    if let Some(last_part) = parts.last() {
+                        match &last_part.state {
+                            CommandPartState::Autocomplete { suggestion } => {
+                                let str = state.command_input.input.value();
+                                if suggestion.len() < str.len() {
+                                    return;
+                                }
+                                let mut string = String::with_capacity(
+                                    str.len() - last_part.len() + suggestion.len(),
+                                );
+                                string.push_str(str);
+                                string.push_str(
+                                    &suggestion[last_part.content().len()..suggestion.len()],
+                                );
+                                state.command_input.set_input_value(string);
+                            }
+                            _ => state.command_output.push(CommandOutput {
+                                style: styles::COMMAND_OUTPUT_INFO,
+                                message: Cow::from("cannot autocomplete :/"),
+                            }),
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {
                 if let Some(change) = state.command_input.input.handle_event(&event) {
                     if change.value {
@@ -438,12 +508,25 @@ fn ui(frame: &mut Frame, state: &mut InteractiveState, io: &Rc<InteractiveIo>) {
     }
     frame.render_widget(command_line_block, command_line_area);
 
+    let visual_scroll = state
+        .command_input
+        .input
+        .visual_scroll(command_input_area.width as usize);
     let command_input: CommandInput<Cell> = CommandInput::new()
         .base_style(styles::COMMAND_BASE)
         .ignored_style(styles::COMMAND_IGNORED)
         .error_style(styles::COMMAND_ERROR)
         .error_comment_style(styles::COMMAND_ERROR_COMMENT)
-        .suggestion_style(styles::COMMAND_SUGGESTION);
+        .suggestion_style(styles::COMMAND_SUGGESTION)
+        .scroll((0, visual_scroll as u16));
+
+    if state.activity == Activity::Command {
+        let visual_cursor = state.command_input.input.visual_cursor() - visual_scroll;
+        frame.set_cursor(
+            command_input_area.x + visual_cursor as u16,
+            command_input_area.y,
+        );
+    }
     frame.render_stateful_widget(command_input, command_input_area, &mut state.command_input);
 
     let command_output_block = Block::new().title(" Command output ").borders(Borders::ALL);
